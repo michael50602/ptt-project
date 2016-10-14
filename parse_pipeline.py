@@ -168,7 +168,7 @@ class Parse_Members(beam.DoFn):
 
 def run(argv = None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input', dest = 'input', default = 'gs://ptt-data/Gossiping.20120606.tgz')
+    parser.add_argument('--input', dest = 'input', default = 'gs://ptt-source-posu-cto-1/pttsource/Go*')
     parser.add_argument('--output', dest = 'output', default = 'gs://ptt-data/output')
     args, pipeline_args = parser.parse_known_args(argv)
     p = beam.Pipeline(argv = pipeline_args)
