@@ -5,4 +5,4 @@ ptt-parse-raw-data-cloud:
 ptt-parse-raw-data-local:
 	python parse_pipeline.py
 count-word:
-	python -m apache_beam.examples.wordcount --project $(PROJ_ID)  --job_name $(PROJ_ID)-wordcount --runner BlockingDataflowPipelineRunner --staging_location gs://$(BUCKET_NAME)/staging --temp_location gs://$(BUCKET_NAME)/temp --output $BUCKET/output
+	python -m apache_beam.examples.wordcount --project $(PROJ_ID)  --job_name $(PROJ_ID)-wordcount --runner BlockingDataflowPipelineRunner --staging_location gs://$(BUCKET_NAME)/staging --temp_location gs://$(BUCKET_NAME)/temp --output gs://$(BUCKET_NAME)/output

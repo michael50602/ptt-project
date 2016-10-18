@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import apache_beam as beam
 from apache_beam.utils.options import PipelineOptions
+from apache_beam.utils.options import SetupOptions
 from apache_beam.io import filebasedsource
 from apache_beam.transforms import PTransform
 from apache_beam.io.iobase import Read
@@ -10,30 +11,76 @@ from apache_beam.io import range_trackers
 import argparse
 import logging
 
+class ExtractFileContent(beam.DoFn):
+    def create_service(self):
+        from googleapiclient import discovery
+        from oauth2client.client import GoogleCredentials
+        credentials = GoogleCredentials.get_application_default()
+        return discovery.build('storage', 'v1', credentials=credentials)
+    def get_object(self, bucket, filename, out_file):
+        from googleapiclient import http
+        service = self.create_service()
+        req = service.objects().get_media(bucket='ptt-source-posu-cto-1', object='pttsource/G-baseball.20120606.tgz')
+        downloader = http.MediaIoBaseDownload(out_file, req)
+        done = False
+        while done is False:
+            status, done = downloader.next_chunk()
+            print("Download {}%.".format(int(status.progress() * 100)))
+        return out_file
+
+    def process(self, context):
+        import tarfile
+        import tempfile
+        file_name = context.element
+        f = tempfile.TemporaryFile()
+        f = self.get_object('ptt-source-posu-cto-1', 'pttsource/G-baseball.20120606.tgz.txt', f)
+        f.seek(0, 0)
+        print f.tell()
+        tar = tarfile.open(fileobj = f, mode='r')
+        for m in tar.getmembers():
+            logging.info("the file name is %s", m.name)
+        return [(1)]
+
+
 class Ptt_Compressed_Source(filebasedsource.FileBasedSource):
+    def __init__(self, file_pattern, split, comp_type):
+        super(Ptt_Compressed_Source, self).__init__(file_pattern, splittable=split, compression_type = comp_type)
+    def estimate_size(self):
+        logging.infor("estimate_size is %d", self._get_concat_source().estimate_size())
+        return self._get_concat_source().estimate_size()
     def read_records(self, file_name, range_tracker):
         import tarfile
         import re
+        import StringIO
         start_offset = range_tracker.start_position()
-        with self.open_file(file_name) as f:
-            tar = tarfile.open(fileobj = f) 
-            # make key value format as { 'file_id': {'text': text_content, 'push': push_content} }
-            text_push_pair = {}
-            for member in tar.getmembers():
-                if member.isfile():
-                    file_id = member.name[:-9]
-                    if file_id not in text_push_pair.keys():
-                        text_push_pair[file_id] = {'push':None, 'text':None}
-                    f = tar.extractfile(member)
-                    content = f.read()
-                    # classify whether the file is a push or text
-                    if re.search(".*text\\.txt", member.name):
-                        text_push_pair[file_id]['text'] = content
-                    elif re.search(".*push\\.txt", member.name):
-                        text_push_pair[file_id]['push'] = content
-                    else:
-                        continue
-        return text_push_pair.items() 
+        f = self.open_file(file_name)
+        start = range_tracker.start_position
+        text_str = str(f.read(f._read_size))
+        print len(text_str)
+        print f._read_size
+        #text_str = re.sub('\\x1B.*?[\\x41-\\x5A\\x61-\\x7A]', '', text_str)
+        #text_str = text_str.decode('big5', errors = 'ignore').encode('UTF-8', errors = 'ignore')
+        tar = tarfile.open(fileobj=StringIO.StringIO(text_str), bufsize=f._read_size)
+        for mem in tar.getmembers():
+            print mem.name
+        return [(1)]
+        # make key value format as { 'file_id': {'text': text_content, 'push': push_content} }
+        text_push_pair = {}
+        for member in tar.getmembers():
+            if member.isfile():
+                file_id = member.name[:-9]
+                if file_id not in text_push_pair.keys():
+                    text_push_pair[file_id] = {'push':None, 'text':None}
+                f = tar.extractfile(member)
+                content = f.read()
+                # classify whether the file is a push or text
+                if re.search(".*text\\.txt", member.name):
+                    text_push_pair[file_id]['text'] = content
+                elif re.search(".*push\\.txt", member.name):
+                    text_push_pair[file_id]['push'] = content
+                else:
+                    continue
+        return [(file_name, text_push_pair)] 
 
 class Parse_Members(beam.DoFn):
     def is_time_column(self, col):
@@ -166,14 +213,19 @@ class Parse_Members(beam.DoFn):
             parse_result['text'] = push_list
         return [(file_name, parse_result)]
 
+
 def run(argv = None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input', dest = 'input', default = 'gs://ptt-source-posu-cto-1/pttsource/Go*')
+    parser.add_argument('--input', dest = 'input', default = 'gs://ptt-source-posu-cto-1/pttsource/Gossiping.20120606.tgz')
     parser.add_argument('--output', dest = 'output', default = 'gs://ptt-data/output')
     args, pipeline_args = parser.parse_known_args(argv)
-    p = beam.Pipeline(argv = pipeline_args)
-    pcoll = p | 'Read' >> beam.Read(Ptt_Compressed_Source(args.input, splittable = False))
-    pcoll | beam.ParDo('parse tar member', Parse_Members())
+    pipeline_options = PipelineOptions(pipeline_args)
+    pipeline_options.view_as(SetupOptions).save_main_session = True
+    p = beam.Pipeline(options=pipeline_options)
+    #pcoll = p | "Read" >> beam.io.Read(Ptt_Compressed_Source(args.input, split = False, comp_type = fileio.CompressionTypes.GZIP))
+    #pcoll | beam.ParDo('parse tar member', Parse_Members())
+    lines = p | "Read file name" >> beam.io.Read(beam.io.TextFileSource(args.input))
+    lines | "Extract file content" >> beam.ParDo(ExtractFileContent())
     p.run()
 
 if __name__ == "__main__":
