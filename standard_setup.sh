@@ -8,6 +8,8 @@ virtualenv $1
 source $1/bin/activate
 sudo pip install numpy
 sudo pip install ipython
+#! be aware of the version of oauth2client
+sudo pip install --upgrade google-api-python-client
 
 #wget https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-130.0.0-linux-x86_64.tar.gz
 #tar zxvf google-cloud-sdk-130.0.0-linux-x86_64.tar.gz

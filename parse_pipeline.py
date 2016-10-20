@@ -11,6 +11,9 @@ from apache_beam.io import range_trackers
 import argparse
 import logging
 
+#! global variable setting they will move to Makefile in future
+bucket = "ptt-source-posu-cto-1"
+
 class ExtractFileContent(beam.DoFn):
     def create_service(self):
         from googleapiclient import discovery
@@ -20,26 +23,40 @@ class ExtractFileContent(beam.DoFn):
     def get_object(self, bucket, filename, out_file):
         from googleapiclient import http
         service = self.create_service()
-        req = service.objects().get_media(bucket='ptt-source-posu-cto-1', object='pttsource/G-baseball.20120606.tgz')
+        req = service.objects().get_media(bucket=bucket, object=filename)
         downloader = http.MediaIoBaseDownload(out_file, req)
         done = False
         while done is False:
             status, done = downloader.next_chunk()
-            print("Download {}%.".format(int(status.progress() * 100)))
+            logging.info("file {} Download {}%.".format(filename, int(status.progress() * 100)))
         return out_file
 
     def process(self, context):
         import tarfile
         import tempfile
+        import re
+        global bucket
         file_name = context.element
         f = tempfile.TemporaryFile()
-        f = self.get_object('ptt-source-posu-cto-1', 'pttsource/G-baseball.20120606.tgz.txt', f)
+        f = self.get_object(bucket, file_name, f)
         f.seek(0, 0)
-        print f.tell()
         tar = tarfile.open(fileobj = f, mode='r')
-        for m in tar.getmembers():
-            logging.info("the file name is %s", m.name)
-        return [(1)]
+        text_push_pair = {}
+        for member in tar.getmembers():
+            if member.isfile():
+                file_id = member.name[:-9]
+                if file_id not in text_push_pair.keys():
+                    text_push_pair[file_id] = {'push':None, 'text':None}
+                f = tar.extractfile(member)
+                content = f.read()
+                # classify whether the file is a push or text
+                if re.search(".*text\\.txt", member.name):
+                    text_push_pair[file_id]['text'] = content
+                elif re.search(".*push\\.txt", member.name):
+                    text_push_pair[file_id]['push'] = content
+                else:
+                    continue
+        return text_push_pair.items() 
 
 
 class Ptt_Compressed_Source(filebasedsource.FileBasedSource):
@@ -155,8 +172,8 @@ class Parse_Members(beam.DoFn):
         text_output = pattern.search(text_str)
         if text_output is not None:
             parse_result['text'] = text_output.groupdict()
-            parse_time = time.strptime(parse_result['text']['time'], '%a %b %d %H:%M:%S %Y')
-            parse_result['text']['time'] = datetime.datetime(parse_time.tm_year, parse_time.tm_mon, parse_time.tm_mday, parse_time.tm_hour, parse_time.tm_min, parse_time.tm_sec)
+            #parse_time = time.strptime(parse_result['text']['time'], '%a %b %d %H:%M:%S %Y')
+            #parse_result['text']['time'] = datetime.datetime(parse_time.tm_year, parse_time.tm_mon, parse_time.tm_mday, parse_time.tm_hour, parse_time.tm_min, parse_time.tm_sec)
 
         # parse push string
         if pt_dict['push'] is not None: 
@@ -200,6 +217,7 @@ class Parse_Members(beam.DoFn):
             for i, t in enumerate(words[:, type_index]):
                 if i in filter_push:
                     continue
+                t = str(t)
                 if t == '推':
                     push_list[i]['type'] = 1
                 elif t == '噓':
@@ -216,7 +234,7 @@ class Parse_Members(beam.DoFn):
 
 def run(argv = None):
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input', dest = 'input', default = 'gs://ptt-source-posu-cto-1/pttsource/Gossiping.20120606.tgz')
+    parser.add_argument('--input', dest = 'input', default = 'gs://ptt-source-posu-cto-1/pttsource/file_name.txt')
     parser.add_argument('--output', dest = 'output', default = 'gs://ptt-data/output')
     args, pipeline_args = parser.parse_known_args(argv)
     pipeline_options = PipelineOptions(pipeline_args)
@@ -225,7 +243,7 @@ def run(argv = None):
     #pcoll = p | "Read" >> beam.io.Read(Ptt_Compressed_Source(args.input, split = False, comp_type = fileio.CompressionTypes.GZIP))
     #pcoll | beam.ParDo('parse tar member', Parse_Members())
     lines = p | "Read file name" >> beam.io.Read(beam.io.TextFileSource(args.input))
-    lines | "Extract file content" >> beam.ParDo(ExtractFileContent())
+    lines | "Extract file content" >> beam.ParDo(ExtractFileContent()) | beam.ParDo('parse text and push', Parse_Members())
     p.run()
 
 if __name__ == "__main__":
