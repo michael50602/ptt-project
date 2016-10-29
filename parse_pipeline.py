@@ -3,10 +3,11 @@
 import apache_beam as beam
 from apache_beam.utils.options import PipelineOptions
 from apache_beam.utils.options import SetupOptions
-from apache_beam.io import filebasedsource
-from apache_beam.transforms import PTransform
+from apache_beam.internal.clients import bigquery
 from apache_beam.io.iobase import Read
 from apache_beam.io import fileio
+from apache_beam.io import BigQuerySink 
+from apache_beam.io import BigQueryDisposition
 from apache_beam.io import range_trackers
 import argparse
 import logging
@@ -58,51 +59,36 @@ class ExtractFileContent(beam.DoFn):
                     continue
         return text_push_pair.items() 
 
-
-class Ptt_Compressed_Source(filebasedsource.FileBasedSource):
-    def __init__(self, file_pattern, split, comp_type):
-        super(Ptt_Compressed_Source, self).__init__(file_pattern, splittable=split, compression_type = comp_type)
-    def estimate_size(self):
-        logging.infor("estimate_size is %d", self._get_concat_source().estimate_size())
-        return self._get_concat_source().estimate_size()
-    def read_records(self, file_name, range_tracker):
-        import tarfile
+class Parse_Text_Members(beam.DoFn):
+    def process(self, context):
         import re
-        import StringIO
-        start_offset = range_tracker.start_position()
-        f = self.open_file(file_name)
-        start = range_tracker.start_position
-        text_str = str(f.read(f._read_size))
-        print len(text_str)
-        print f._read_size
-        #text_str = re.sub('\\x1B.*?[\\x41-\\x5A\\x61-\\x7A]', '', text_str)
-        #text_str = text_str.decode('big5', errors = 'ignore').encode('UTF-8', errors = 'ignore')
-        tar = tarfile.open(fileobj=StringIO.StringIO(text_str), bufsize=f._read_size)
-        for mem in tar.getmembers():
-            print mem.name
-        return [(1)]
-        # make key value format as { 'file_id': {'text': text_content, 'push': push_content} }
-        text_push_pair = {}
-        for member in tar.getmembers():
-            if member.isfile():
-                file_id = member.name[:-9]
-                if file_id not in text_push_pair.keys():
-                    text_push_pair[file_id] = {'push':None, 'text':None}
-                f = tar.extractfile(member)
-                content = f.read()
-                # classify whether the file is a push or text
-                if re.search(".*text\\.txt", member.name):
-                    text_push_pair[file_id]['text'] = content
-                elif re.search(".*push\\.txt", member.name):
-                    text_push_pair[file_id]['push'] = content
-                else:
-                    continue
-        return [(file_name, text_push_pair)] 
+        import datetime
+        file_name, pt_dict = context.element
+        # parse date from file_name
+        parse_date = re.search("\\.(?P<milisecond>[0-9]*)\\.", file_name)
+        if parse_date is None:
+            return
+        file_date = datetime.datetime.fromtimestamp( int(parse_date.groupdict()['milisecond'])/1000.0 )
+        # parse text string
+        text_str = pt_dict['text']
+        text_str = re.sub('\\x1B.*?[\\x41-\\x5A\\x61-\\x7A]', '', text_str)
+        text_str = text_str.decode('big5', errors = 'ignore')#.encode('UTF-8', errors = 'ignore')
+        pattern = re.compile(u"作者: (?P<author>.*) \\((?P<nickname>.*)\\) 看板: (?P<board>.*)\\n標題:(?P<topic>.*)\\n時間: (?P<time>[^\\n]*)\\n(?P<content>(?:.|\\n)*)(?:From|來自): (?P<ip>.*).*", re.UNICODE)
+        text_output = pattern.search(text_str)
+        if text_output is not None:
+            parse_result = text_output.groupdict()
+            #parse_time = time.strptime(parse_result['text']['time'], '%a %b %d %H:%M:%S %Y')
+            #parse_result['text']['time'] = datetime.datetime(parse_time.tm_year, parse_time.tm_mon, parse_time.tm_mday, parse_time.tm_hour, parse_time.tm_min, parse_time.tm_sec)
+            parse_result['file_name'] = file_name
+            return [parse_result]
+        else:
+            return
 
-class Parse_Members(beam.DoFn):
+
+class Parse_Push_Members(beam.DoFn):
     def is_time_column(self, col):
         import re
-        time_pat = re.compile("(?P<month>[0-9]{2})\/(?P<day>[0-9]{2}) ?(?P<hour>[0-9]{2})?:?(?P<minute>[0-9]{2})?")
+        time_pat = re.compile(u"(?P<month>[0-9]{2})\/(?P<day>[0-9]{2}) ?(?P<hour>[0-9]{2})?:?(?P<minute>[0-9]{2})?", re.UNICODE)
         if time_pat.search(col[0]) is not None:
             return True
         else:
@@ -110,7 +96,7 @@ class Parse_Members(beam.DoFn):
 
     def is_id_column(self, col):
         import re
-        id_pat = re.compile("^[a-zA-Z0-9]+$")
+        id_pat = re.compile(u"^[a-zA-Z0-9]+$", re.UNICODE)
         for c in col:
             if id_pat.search(c) is None:
                 return False
@@ -118,7 +104,7 @@ class Parse_Members(beam.DoFn):
 
     def is_type_column(self, col):
         import re
-        type_pat = re.compile("^[推噓→]")
+        type_pat = re.compile(u"^[推噓→]", re.UNICODE)
         for c in col:
             if type_pat.match(c) is None:
                 return False
@@ -163,18 +149,6 @@ class Parse_Members(beam.DoFn):
         if parse_date is None:
             return
         file_date = datetime.datetime.fromtimestamp( int(parse_date.groupdict()['milisecond'])/1000.0 )
-        file_year = 0
-        # parse text string
-        text_str = pt_dict['text']
-        text_str = re.sub('\\x1B.*?[\\x41-\\x5A\\x61-\\x7A]', '', text_str)
-        text_str = text_str.decode('big5', errors = 'ignore').encode('UTF-8', errors = 'ignore')
-        pattern = re.compile("作者: (?P<author>.*) \\((?P<nick_name>.*)\\) 看板: (?P<board>.*)\\n標題:(?P<topic>.*)\\n時間: (?P<time>[^\\n]*)\\n(?P<content>(?:.|\\n)*)(?:From|來自): (?P<ip>.*).*")
-        text_output = pattern.search(text_str)
-        if text_output is not None:
-            parse_result['text'] = text_output.groupdict()
-            #parse_time = time.strptime(parse_result['text']['time'], '%a %b %d %H:%M:%S %Y')
-            #parse_result['text']['time'] = datetime.datetime(parse_time.tm_year, parse_time.tm_mon, parse_time.tm_mday, parse_time.tm_hour, parse_time.tm_min, parse_time.tm_sec)
-
         # parse push string
         if pt_dict['push'] is not None: 
             push_str = pt_dict['push']
@@ -195,9 +169,9 @@ class Parse_Members(beam.DoFn):
             id_index = line_format['id']
             type_index = line_format['type']
             content_index = line_format['content']
-            time_pat = re.compile("(?P<month>[0-9]{2})\/(?P<day>[0-9]{2}) ?(?P<hour>[0-9]{2})?:?(?P<minute>[0-9]{2})?")
-            id_pat = re.compile("^[a-zA-Z0-9]+$")
-            type_pat = re.compile("^[推噓→]$")
+            time_pat = re.compile(u"(?P<month>[0-9]{2})\/(?P<day>[0-9]{2}) ?(?P<hour>[0-9]{2})?:?(?P<minute>[0-9]{2})?")
+            id_pat = re.compile(u"^[a-zA-Z0-9]+$")
+            type_pat = re.compile(u"^[推噓→]$")
             filter_push = []
             for i, t in enumerate(words[:, time_index]):
                 result = time_pat.search(t)
@@ -218,9 +192,9 @@ class Parse_Members(beam.DoFn):
                 if i in filter_push:
                     continue
                 t = str(t)
-                if t == '推':
+                if t == u'推':
                     push_list[i]['type'] = 1
-                elif t == '噓':
+                elif t == u'噓':
                     push_list[i]['type'] = -1
                 else:
                     push_list[i]['type'] = 0
@@ -229,7 +203,8 @@ class Parse_Members(beam.DoFn):
                     continue
                 push_list[i]['content'] = c
             parse_result['text'] = push_list
-        return [(file_name, parse_result)]
+        return [{'mykey':[1, 2, 30]}]
+        #return [("test-string")]
 
 
 def run(argv = None):
@@ -240,10 +215,12 @@ def run(argv = None):
     pipeline_options = PipelineOptions(pipeline_args)
     pipeline_options.view_as(SetupOptions).save_main_session = True
     p = beam.Pipeline(options=pipeline_options)
-    #pcoll = p | "Read" >> beam.io.Read(Ptt_Compressed_Source(args.input, split = False, comp_type = fileio.CompressionTypes.GZIP))
-    #pcoll | beam.ParDo('parse tar member', Parse_Members())
-    lines = p | "Read file name" >> beam.io.Read(beam.io.TextFileSource(args.input))
-    lines | "Extract file content" >> beam.ParDo(ExtractFileContent()) | beam.ParDo('parse text and push', Parse_Members())
+    text_schema = u"ip:STRING,file_name:STRING,content:STRING,board:STRING,time:STRING,topic:STRING,author:STRING,nickname:STRING"
+    push_schema = u"mykey:RECORD"
+    file_cont = p | "Read file name" >> beam.io.Read(beam.io.TextFileSource(args.input)) | "Extract File Content" >> beam.ParDo(ExtractFileContent())
+    file_cont | "Parse Push Members" >> beam.ParDo(Parse_Push_Members()) | "Write Push to BigTable" >> beam.io.Write(beam.io.BigQuerySink(table="ptt_push", dataset="ptt_dataset", project="ptt-project", schema=push_schema))
+    file_cont | "Parse Text Members" >> beam.ParDo(Parse_Text_Members()) #| "Write Text to BigTable" >> beam.io.Write(beam.io.BigQuerySink(table="ptt_text", dataset="ptt_dataset", project="ptt-project", schema=text_schema))
+    #id_cont | "Write to BigQuery" >> beam.io.Write(beam.io.BigQuerySink(table="ptt_table", project="ptt-project", schema=schema, dataset="ptt_dataset", create_disposition='CREATE_IF_NEEDED'))
     p.run()
 
 if __name__ == "__main__":

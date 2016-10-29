@@ -19,3 +19,4 @@ curl http://repo1.maven.org/maven2/io/netty/netty-tcnative-boringssl-static/1.1.
 export JAVA_HOME=$(update-alternatives --list java | tail -1 | sed -E 's/\/bin\/java//')
 
 sudo apt-get install maven
+
