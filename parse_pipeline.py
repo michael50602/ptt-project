@@ -96,17 +96,28 @@ class Parse_Push_Members(beam.DoFn):
 
     def is_id_column(self, col):
         import re
-        id_pat = re.compile(u"^[a-zA-Z0-9]+$", re.UNICODE)
+        id_pat = re.compile(u"^[a-zA-Z0-9\\*]+$", re.UNICODE)
+        not_ascii = []
         for c in col:
             if id_pat.search(c) is None:
-                return False
-        return True
-
+                not_ascii.append(c)
+        if len(not_ascii) / len(col) <= 0.1:
+            return True
+        else :
+            return False
     def is_type_column(self, col):
         import re
         type_pat = re.compile(u"^[推噓→]", re.UNICODE)
         for c in col:
             if type_pat.match(c) is None:
+                return False
+        return True
+
+    def is_ip_column(self, col):
+        import re
+        ip_pat = re.compile(u"[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+", re.UNICODE)
+        for c in col:
+            if ip_pat.match(c) is None:
                 return False
         return True
         
@@ -122,7 +133,7 @@ class Parse_Push_Members(beam.DoFn):
             if len(l) > 0 and len(process_line) == normal_length:
                 words.append(process_line)
         words = np.array(words)
-        for i in range(4):
+        for i in range(len(words[0])):
             if line_format['time'] is None and self.is_time_column(words[:, i]):
                 line_format['time'] = i
                 continue
@@ -131,6 +142,8 @@ class Parse_Push_Members(beam.DoFn):
                 continue
             elif line_format['type'] is None and self.is_type_column(words[:, i]):
                 line_format['type'] = i
+                continue
+            elif self.is_ip_column(words[:, i]) and len(words[0]) > 4: # emit ip column
                 continue
             else:
                 line_format['content'] = i
@@ -149,14 +162,15 @@ class Parse_Push_Members(beam.DoFn):
         if parse_date is None:
             return
         file_date = datetime.datetime.fromtimestamp( int(parse_date.groupdict()['milisecond'])/1000.0 )
+        push_list = None
         # parse push string
         if pt_dict['push'] is not None: 
             push_str = pt_dict['push']
             push_str = re.sub('\\x1B.*?[\\x41-\\x5A\\x61-\\x7A]', '', push_str)
             push_str = re.sub('\\t{2}', '\\t', push_str) # remove a '\t' in push_str
-            push_str = push_str.decode('big5', errors = 'ignore').encode('UTF-8', errors = 'ignore')
+            push_str = push_str.decode('big5', errors = 'ignore')#.encode('UTF-8', errors = 'ignore')
             lines = push_str.split('\n')
-            push_list = [ {'time': None, 'id': None, 'type': None, 'content': None} for i in range(len(lines))]
+            push_list = [ {'file_name': file_name, 'file_date':int(parse_date.groupdict()['milisecond']), 'time': None, 'id': None, 'type': None, 'content': None} for i in range(len(lines))]
             line_format = self.parse_push_format(lines) # parse which column is content, id, type & time 
             words = []
             normal_length = len(lines[0].split('\t'))
@@ -169,41 +183,37 @@ class Parse_Push_Members(beam.DoFn):
             id_index = line_format['id']
             type_index = line_format['type']
             content_index = line_format['content']
-            time_pat = re.compile(u"(?P<month>[0-9]{2})\/(?P<day>[0-9]{2}) ?(?P<hour>[0-9]{2})?:?(?P<minute>[0-9]{2})?")
-            id_pat = re.compile(u"^[a-zA-Z0-9]+$")
-            type_pat = re.compile(u"^[推噓→]$")
+            time_pat = re.compile(u"(?P<month>[0-9]{2})\/(?P<day>[0-9]{2}) ?(?P<hour>[0-9]{2})?:?(?P<minute>[0-9]{2})?", re.UNICODE)
+            id_pat = re.compile(u"^[a-zA-Z0-9\\*]+$", re.UNICODE)
+            type_pat = re.compile(u"^[推噓→]$"), re.UNICODE
             filter_push = []
             for i, t in enumerate(words[:, time_index]):
                 result = time_pat.search(t)
                 push_list[i]['time'] = 0
                 try:
                     if result.groupdict()['hour'] is not None and result.groupdict()['minute'] is not None:
-                        push_list[i]['time'] = datetime.datetime(file_date.year, int(result.groupdict()['month']), int(result.groupdict()['day']), int(result.groupdict()['hour']), int(result.groupdict()['minute']))
+                        push_list[i]['time'] = str((datetime.datetime(file_date.year, int(result.groupdict()['month']), int(result.groupdict()['day']), int(result.groupdict()['hour']), int(result.groupdict()['minute'])) - datetime.datetime(1970, 1, 1)).total_seconds())
                     else:
-                        push_list[i]['time'] = datetime.datetime(file_date.year, int(result.groupdict()['month']), int(result.groupdict()['day']))
+                        push_list[i]['time'] = str((datetime.datetime(file_date.year, int(result.groupdict()['month']), int(result.groupdict()['day'])) - datetime.datetime(1970, 1, 1)).total_seconds())
                 except:
-                    filter_push.append(i)
-                    continue
+                    push_list[i]['time'] = t
             for i, u in enumerate(words[:, id_index]):
-                if i in filter_push:
-                    continue
                 push_list[i]['id'] = u
-            for i, t in enumerate(words[:, type_index]):
-                if i in filter_push:
-                    continue
-                t = str(t)
-                if t == u'推':
-                    push_list[i]['type'] = 1
-                elif t == u'噓':
-                    push_list[i]['type'] = -1
-                else:
-                    push_list[i]['type'] = 0
+            try:
+                for i, t in enumerate(words[:, type_index]):
+                    if t == u'推':
+                        push_list[i]['type'] = 1
+                    elif t == u'噓':
+                        push_list[i]['type'] = -1
+                    else:
+                        push_list[i]['type'] = 0
+            except:
+                logging.info("file_name is %r, words is %r", file_name, words[:, type_index])
             for i, c in enumerate(words[:, content_index]):
-                if i in filter_push:
-                    continue
                 push_list[i]['content'] = c
             parse_result['text'] = push_list
-        return [{'mykey':[1, 2, 30]}]
+            print push_list
+        return push_list 
         #return [("test-string")]
 
 
@@ -216,7 +226,7 @@ def run(argv = None):
     pipeline_options.view_as(SetupOptions).save_main_session = True
     p = beam.Pipeline(options=pipeline_options)
     text_schema = u"ip:STRING,file_name:STRING,content:STRING,board:STRING,time:STRING,topic:STRING,author:STRING,nickname:STRING"
-    push_schema = u"mykey:RECORD"
+    push_schema = u"file_name:STRING, file_date:TIMESTAMP, content:STRING,type:INTEGER,id:STRING,time:STRING"
     file_cont = p | "Read file name" >> beam.io.Read(beam.io.TextFileSource(args.input)) | "Extract File Content" >> beam.ParDo(ExtractFileContent())
     file_cont | "Parse Push Members" >> beam.ParDo(Parse_Push_Members()) | "Write Push to BigTable" >> beam.io.Write(beam.io.BigQuerySink(table="ptt_push", dataset="ptt_dataset", project="ptt-project", schema=push_schema))
     file_cont | "Parse Text Members" >> beam.ParDo(Parse_Text_Members()) #| "Write Text to BigTable" >> beam.io.Write(beam.io.BigQuerySink(table="ptt_text", dataset="ptt_dataset", project="ptt-project", schema=text_schema))
